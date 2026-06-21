@@ -165,3 +165,62 @@ export const modelsByProvider = chatModels.reduce(
   },
   {} as Record<string, ChatModel[]>
 );
+
+export type StudioModelKind = "image" | "video" | "voice";
+
+export type StudioModel = {
+  id: string;
+  name: string;
+  provider: string;
+  description: string;
+  kind: StudioModelKind;
+  gatewayOrder: string[];
+};
+
+export const studioModels: StudioModel[] = [
+  {
+    id: "nvidia/cosmos3-nano",
+    name: "Cosmos 3 Nano",
+    provider: "nvidia",
+    description: "Fast omnimodal generation — image, video, and audio",
+    kind: "image",
+    gatewayOrder: ["deepinfra"],
+  },
+  {
+    id: "nvidia/cosmos3-super",
+    name: "Cosmos 3 Super",
+    provider: "nvidia",
+    description: "High-fidelity omnimodal generation — image, video, and audio",
+    kind: "image",
+    gatewayOrder: ["deepinfra"],
+  },
+];
+
+export const studioChatModels: ChatModel[] = [
+  {
+    id: "google/gemma-4-26b-a4b-it",
+    name: "Gemma 4 26B-A4B",
+    provider: "google",
+    description: "Multimodal MoE chat model (26B total, 4B active)",
+    gatewayOrder: ["deepinfra"],
+  },
+  {
+    id: "google/gemma-4-31b-it",
+    name: "Gemma 4 31B",
+    provider: "google",
+    description: "Multimodal chat model for the App Builder assistant",
+    gatewayOrder: ["deepinfra"],
+  },
+];
+
+export function getStudioModelsByKind(kind: StudioModelKind): StudioModel[] {
+  return studioModels.filter((m) => m.kind === kind);
+}
+
+export const allowedStudioModelIds = new Set(
+  studioModels.map((m) => m.id)
+);
+
+export const allowedStudioChatModelIds = new Set(
+  studioChatModels.map((m) => m.id)
+);

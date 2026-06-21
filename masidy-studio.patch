@@ -1,0 +1,1370 @@
+diff --git a/.env.example b/.env.example
+index 8433714..b85f548 100644
+--- a/.env.example
++++ b/.env.example
+@@ -13,3 +13,9 @@ POSTGRES_URL=****
+ 
+ # https://vercel.com/docs/redis
+ REDIS_URL=****
++
++# Voice Studio calls DeepInfra's TTS API directly (AI Gateway doesn't
++# route speech models yet). Image Studio, Video Studio, and App Builder
++# all go through AI_GATEWAY_API_KEY above instead.
++# https://deepinfra.com/dash/api_keys
++DEEPINFRA_API_KEY=****
+diff --git a/app/(chat)/api/studio/app-builder/route.ts b/app/(chat)/api/studio/app-builder/route.ts
+new file mode 100644
+index 0000000..1b8c493
+--- /dev/null
++++ b/app/(chat)/api/studio/app-builder/route.ts
+@@ -0,0 +1,74 @@
++import { gateway, generateObject } from "ai";
++import { z } from "zod";
++import { auth } from "@/app/(auth)/auth";
++import { allowedStudioChatModelIds } from "@/lib/ai/models";
++import { ChatbotError } from "@/lib/errors";
++
++const APP_BUILDER_MODEL = "google/gemma-4-31b-it";
++
++const requestSchema = z.object({
++  prompt: z.string().min(1).max(4000),
++});
++
++const fileSchema = z.object({
++  path: z.string(),
++  language: z.string(),
++  content: z.string(),
++});
++
++const planSchema = z.object({
++  appName: z.string(),
++  summary: z.string(),
++  stack: z.array(z.string()),
++  files: z.array(fileSchema).max(12),
++  nextSteps: z.array(z.string()).max(6),
++});
++
++export async function POST(request: Request) {
++  const session = await auth();
++
++  if (!session?.user) {
++    return new ChatbotError("unauthorized:studio").toResponse();
++  }
++
++  let body: z.infer<typeof requestSchema>;
++
++  try {
++    body = requestSchema.parse(await request.json());
++  } catch {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Invalid request body."
++    ).toResponse();
++  }
++
++  if (!allowedStudioChatModelIds.has(APP_BUILDER_MODEL)) {
++    return new ChatbotError(
++      "bad_request:studio",
++      "App Builder model is not configured."
++    ).toResponse();
++  }
++
++  try {
++    const result = await generateObject({
++      model: gateway.languageModel(APP_BUILDER_MODEL),
++      schema: planSchema,
++      system:
++        "You are an app-scaffolding assistant. Given a short description, " +
++        "produce a minimal, runnable starting point: a short app name, a " +
++        "one-paragraph summary, the tech stack as a list, up to 12 small " +
++        "starter files with real working code (favor a single-file React " +
++        "or Next.js component unless the request clearly needs more), and " +
++        "up to 6 concrete next steps the user should take after scaffolding.",
++      prompt: body.prompt,
++    });
++
++    return Response.json({ plan: result.object, modelId: APP_BUILDER_MODEL });
++  } catch (error) {
++    console.error({ surface: "studio:app-builder", error });
++    return new ChatbotError(
++      "bad_request:studio",
++      "App Builder generation failed. The model or provider may be unavailable."
++    ).toResponse();
++  }
++}
+diff --git a/app/(chat)/api/studio/image/route.ts b/app/(chat)/api/studio/image/route.ts
+new file mode 100644
+index 0000000..186eecb
+--- /dev/null
++++ b/app/(chat)/api/studio/image/route.ts
+@@ -0,0 +1,58 @@
++import { gateway, generateImage } from "ai";
++import { z } from "zod";
++import { auth } from "@/app/(auth)/auth";
++import { allowedStudioModelIds } from "@/lib/ai/models";
++import { ChatbotError } from "@/lib/errors";
++
++const requestSchema = z.object({
++  prompt: z.string().min(1).max(2000),
++  modelId: z.string(),
++  aspectRatio: z.enum(["1:1", "16:9", "9:16", "4:3", "3:4"]).default("1:1"),
++});
++
++export async function POST(request: Request) {
++  const session = await auth();
++
++  if (!session?.user) {
++    return new ChatbotError("unauthorized:studio").toResponse();
++  }
++
++  let body: z.infer<typeof requestSchema>;
++
++  try {
++    body = requestSchema.parse(await request.json());
++  } catch {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Invalid request body."
++    ).toResponse();
++  }
++
++  if (!allowedStudioModelIds.has(body.modelId)) {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Unknown or unsupported model."
++    ).toResponse();
++  }
++
++  try {
++    const result = await generateImage({
++      model: gateway.imageModel(body.modelId),
++      prompt: body.prompt,
++      aspectRatio: body.aspectRatio as `${number}:${number}`,
++    });
++
++    return Response.json({
++      imageBase64: result.image.base64,
++      mediaType: result.image.mediaType,
++      modelId: body.modelId,
++    });
++  } catch (error) {
++    console.error({ surface: "studio:image", error });
++    return new ChatbotError(
++      "bad_request:studio",
++      "Image generation failed. The model or provider may be unavailable."
++    ).toResponse();
++  }
++}
++
+diff --git a/app/(chat)/api/studio/video/route.ts b/app/(chat)/api/studio/video/route.ts
+new file mode 100644
+index 0000000..a2bb803
+--- /dev/null
++++ b/app/(chat)/api/studio/video/route.ts
+@@ -0,0 +1,70 @@
++import { gateway, experimental_generateVideo as generateVideo } from "ai";
++import { z } from "zod";
++import { auth } from "@/app/(auth)/auth";
++import { allowedStudioModelIds } from "@/lib/ai/models";
++import { ChatbotError } from "@/lib/errors";
++
++const requestSchema = z.object({
++  prompt: z.string().min(1).max(2000),
++  modelId: z.string(),
++  aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
++  durationSeconds: z.number().int().min(1).max(8).default(5),
++  withSound: z.boolean().default(false),
++});
++
++export async function POST(request: Request) {
++  const session = await auth();
++
++  if (!session?.user) {
++    return new ChatbotError("unauthorized:studio").toResponse();
++  }
++
++  let body: z.infer<typeof requestSchema>;
++
++  try {
++    body = requestSchema.parse(await request.json());
++  } catch {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Invalid request body."
++    ).toResponse();
++  }
++
++  if (!allowedStudioModelIds.has(body.modelId)) {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Unknown or unsupported model."
++    ).toResponse();
++  }
++
++  try {
++    const result = await generateVideo({
++      model: gateway.videoModel(body.modelId),
++      prompt: body.prompt,
++      aspectRatio: body.aspectRatio as `${number}:${number}`,
++      duration: body.durationSeconds,
++      providerOptions: {
++        deepinfra: {
++          output_type: "video",
++          duration_seconds: body.durationSeconds,
++          // Cosmos3's video-with-sound mode bakes a soundtrack into the
++          // clip itself — there is no separate narration/TTS output here.
++          generate_audio: body.withSound,
++        },
++      },
++    });
++
++    return Response.json({
++      videoBase64: result.video.base64,
++      mediaType: result.video.mediaType,
++      modelId: body.modelId,
++      withSound: body.withSound,
++    });
++  } catch (error) {
++    console.error({ surface: "studio:video", error });
++    return new ChatbotError(
++      "bad_request:studio",
++      "Video generation failed. The model or provider may be unavailable."
++    ).toResponse();
++  }
++}
+diff --git a/app/(chat)/api/studio/voice/route.ts b/app/(chat)/api/studio/voice/route.ts
+new file mode 100644
+index 0000000..c297049
+--- /dev/null
++++ b/app/(chat)/api/studio/voice/route.ts
+@@ -0,0 +1,112 @@
++import { z } from "zod";
++import { auth } from "@/app/(auth)/auth";
++import { ChatbotError } from "@/lib/errors";
++
++// AI Gateway has no speechModel() routing yet, and @ai-sdk/deepinfra
++// doesn't expose a speech model either — so this route calls DeepInfra's
++// REST API directly, the same way the rest of this app would call any
++// provider the Gateway hasn't wrapped yet.
++const DEEPINFRA_TTS_URL = "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-TTS";
++
++const VOICES = [
++  "Vivian",
++  "Serena",
++  "Uncle_Fu",
++  "Dylan",
++  "Eric",
++  "Ryan",
++  "Aiden",
++  "Ono_Anna",
++  "Sohee",
++] as const;
++
++const requestSchema = z.object({
++  text: z.string().min(1).max(4000),
++  voice: z.enum(VOICES).default("Vivian"),
++  instructions: z.string().max(300).optional(),
++  outputFormat: z.enum(["wav", "mp3", "flac", "pcm"]).default("mp3"),
++});
++
++export async function POST(request: Request) {
++  const session = await auth();
++
++  if (!session?.user) {
++    return new ChatbotError("unauthorized:studio").toResponse();
++  }
++
++  if (!process.env.DEEPINFRA_API_KEY) {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Voice Studio isn't configured yet. Add DEEPINFRA_API_KEY to your environment."
++    ).toResponse();
++  }
++
++  let body: z.infer<typeof requestSchema>;
++
++  try {
++    body = requestSchema.parse(await request.json());
++  } catch {
++    return new ChatbotError(
++      "bad_request:studio",
++      "Invalid request body."
++    ).toResponse();
++  }
++
++  try {
++    const response = await fetch(DEEPINFRA_TTS_URL, {
++      method: "POST",
++      headers: {
++        Authorization: `Bearer ${process.env.DEEPINFRA_API_KEY}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({
++        text: body.text,
++        voice_id: body.voice,
++        instructions: body.instructions,
++        output_format: body.outputFormat,
++      }),
++    });
++
++    if (!response.ok) {
++      const errorText = await response.text().catch(() => "");
++      console.error({
++        surface: "studio:voice",
++        status: response.status,
++        errorText,
++      });
++      return new ChatbotError(
++        "bad_request:studio",
++        "Speech generation failed. The model or provider may be unavailable."
++      ).toResponse();
++    }
++
++    const contentType = response.headers.get("content-type") ?? "";
++
++    // Qwen3-TTS returns raw audio bytes on success. If DeepInfra ever
++    // returns JSON instead (e.g. an async job reference), surface that
++    // distinctly rather than silently treating it as audio.
++    if (contentType.includes("application/json")) {
++      const json = await response.json();
++      return Response.json({
++        unexpectedJson: json,
++        note: "DeepInfra returned JSON instead of audio bytes — the response shape may have changed.",
++      });
++    }
++
++    const audioBuffer = await response.arrayBuffer();
++    const audioBase64 = Buffer.from(audioBuffer).toString("base64");
++    const mediaType = contentType || `audio/${body.outputFormat}`;
++
++    return Response.json({
++      audioBase64,
++      mediaType,
++      voice: body.voice,
++    });
++  } catch (error) {
++    console.error({ surface: "studio:voice", error });
++    return new ChatbotError(
++      "bad_request:studio",
++      "Speech generation failed. The model or provider may be unavailable."
++    ).toResponse();
++  }
++}
+diff --git a/app/(studio)/app-builder/page.tsx b/app/(studio)/app-builder/page.tsx
+new file mode 100644
+index 0000000..08c25de
+--- /dev/null
++++ b/app/(studio)/app-builder/page.tsx
+@@ -0,0 +1,5 @@
++import { AppBuilderStudio } from "@/components/chat/studio/app-builder-studio";
++
++export default function Page() {
++  return <AppBuilderStudio />;
++}
+diff --git a/app/(studio)/image/page.tsx b/app/(studio)/image/page.tsx
+new file mode 100644
+index 0000000..d5df760
+--- /dev/null
++++ b/app/(studio)/image/page.tsx
+@@ -0,0 +1,5 @@
++import { ImageStudio } from "@/components/chat/studio/image-studio";
++
++export default function Page() {
++  return <ImageStudio />;
++}
+diff --git a/app/(studio)/layout.tsx b/app/(studio)/layout.tsx
+new file mode 100644
+index 0000000..91f7e6f
+--- /dev/null
++++ b/app/(studio)/layout.tsx
+@@ -0,0 +1,36 @@
++import { cookies } from "next/headers";
++import { Suspense } from "react";
++import { Toaster } from "sonner";
++import { auth } from "@/app/(auth)/auth";
++import { AppSidebar } from "@/components/chat/app-sidebar";
++import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
++
++export default function Layout({ children }: { children: React.ReactNode }) {
++  return (
++    <Suspense fallback={<div className="flex h-dvh bg-sidebar" />}>
++      <StudioShell>{children}</StudioShell>
++    </Suspense>
++  );
++}
++
++async function StudioShell({ children }: { children: React.ReactNode }) {
++  const [session, cookieStore] = await Promise.all([auth(), cookies()]);
++  const isCollapsed = cookieStore.get("sidebar_state")?.value !== "true";
++
++  return (
++    <SidebarProvider defaultOpen={!isCollapsed}>
++      <AppSidebar user={session?.user} />
++      <SidebarInset>
++        <Toaster
++          position="top-center"
++          theme="system"
++          toastOptions={{
++            className:
++              "!bg-card !text-foreground !border-border/50 !shadow-[var(--shadow-float)]",
++          }}
++        />
++        {children}
++      </SidebarInset>
++    </SidebarProvider>
++  );
++}
+diff --git a/app/(studio)/video/page.tsx b/app/(studio)/video/page.tsx
+new file mode 100644
+index 0000000..16e5991
+--- /dev/null
++++ b/app/(studio)/video/page.tsx
+@@ -0,0 +1,5 @@
++import { VideoStudio } from "@/components/chat/studio/video-studio";
++
++export default function Page() {
++  return <VideoStudio />;
++}
+diff --git a/app/(studio)/voice/page.tsx b/app/(studio)/voice/page.tsx
+new file mode 100644
+index 0000000..ab9923b
+--- /dev/null
++++ b/app/(studio)/voice/page.tsx
+@@ -0,0 +1,5 @@
++import { VoiceStudio } from "@/components/chat/studio/voice-studio";
++
++export default function Page() {
++  return <VoiceStudio />;
++}
+diff --git a/components/chat/app-sidebar.tsx b/components/chat/app-sidebar.tsx
+index d276842..a22b540 100644
+--- a/components/chat/app-sidebar.tsx
++++ b/components/chat/app-sidebar.tsx
+@@ -1,13 +1,17 @@
+ "use client";
+ 
+ import {
++  FolderCodeIcon,
++  ImageIcon,
+   MessageSquareIcon,
++  MicIcon,
+   PanelLeftIcon,
+   PenSquareIcon,
+   TrashIcon,
++  VideoIcon,
+ } from "lucide-react";
+ import Link from "next/link";
+-import { useRouter } from "next/navigation";
++import { usePathname, useRouter } from "next/navigation";
+ import type { User } from "next-auth";
+ import { useState } from "react";
+ import { toast } from "sonner";
+@@ -46,6 +50,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
+ 
+ export function AppSidebar({ user }: { user: User | undefined }) {
+   const router = useRouter();
++  const pathname = usePathname();
+   const { setOpenMobile, toggleSidebar } = useSidebar();
+   const { mutate } = useSWRConfig();
+   const [showDeleteAllDialog, setShowDeleteAllDialog] = useState(false);
+@@ -132,6 +137,35 @@ export function AppSidebar({ user }: { user: User | undefined }) {
+               </SidebarMenu>
+             </SidebarGroupContent>
+           </SidebarGroup>
++          <SidebarGroup className="pt-0">
++            <SidebarGroupContent>
++              <SidebarMenu>
++                {[
++                  { href: "/image", label: "Image Studio", icon: ImageIcon },
++                  { href: "/video", label: "Video Studio", icon: VideoIcon },
++                  { href: "/voice", label: "Voice Studio", icon: MicIcon },
++                  {
++                    href: "/app-builder",
++                    label: "App Builder",
++                    icon: FolderCodeIcon,
++                  },
++                ].map(({ href, label, icon: Icon }) => (
++                  <SidebarMenuItem key={href}>
++                    <SidebarMenuButton
++                      asChild
++                      isActive={pathname === href}
++                      tooltip={label}
++                    >
++                      <Link href={href} onClick={() => setOpenMobile(false)}>
++                        <Icon className="size-4" />
++                        <span>{label}</span>
++                      </Link>
++                    </SidebarMenuButton>
++                  </SidebarMenuItem>
++                ))}
++              </SidebarMenu>
++            </SidebarGroupContent>
++          </SidebarGroup>
+           <SidebarHistory user={user} />
+         </SidebarContent>
+         <SidebarFooter className="border-t border-sidebar-border pt-2 pb-3">
+diff --git a/components/chat/studio/app-builder-studio.tsx b/components/chat/studio/app-builder-studio.tsx
+new file mode 100644
+index 0000000..218b96f
+--- /dev/null
++++ b/components/chat/studio/app-builder-studio.tsx
+@@ -0,0 +1,178 @@
++"use client";
++
++import { FolderCodeIcon, SparklesIcon } from "lucide-react";
++import type { BundledLanguage } from "shiki";
++import { useState } from "react";
++import { toast } from "sonner";
++import {
++  CodeBlock,
++  CodeBlockCopyButton,
++  CodeBlockHeader,
++} from "@/components/ai-elements/code-block";
++import { Badge } from "@/components/ui/badge";
++import { Button } from "@/components/ui/button";
++import { Spinner } from "@/components/ui/spinner";
++import { Textarea } from "@/components/ui/textarea";
++import { StudioHeader } from "./studio-header";
++
++type StudioFile = {
++  path: string;
++  language: string;
++  content: string;
++};
++
++type AppPlan = {
++  appName: string;
++  summary: string;
++  stack: string[];
++  files: StudioFile[];
++  nextSteps: string[];
++};
++
++// CodeBlock requires a Shiki-supported language; fall back to plaintext
++// for anything the model returns that Shiki doesn't recognize.
++const SUPPORTED_LANGUAGES = new Set([
++  "javascript",
++  "typescript",
++  "jsx",
++  "tsx",
++  "json",
++  "css",
++  "html",
++  "markdown",
++  "bash",
++  "python",
++  "yaml",
++]);
++
++function toShikiLanguage(language: string): BundledLanguage {
++  const normalized = language.toLowerCase().trim();
++  return (
++    SUPPORTED_LANGUAGES.has(normalized) ? normalized : "plaintext"
++  ) as BundledLanguage;
++}
++
++export function AppBuilderStudio() {
++  const [prompt, setPrompt] = useState("");
++  const [isGenerating, setIsGenerating] = useState(false);
++  const [plan, setPlan] = useState<AppPlan | null>(null);
++
++  const handleGenerate = async () => {
++    if (!prompt.trim()) {
++      toast.error("Describe the app you want to build");
++      return;
++    }
++
++    setIsGenerating(true);
++    setPlan(null);
++
++    try {
++      const response = await fetch("/api/studio/app-builder", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ prompt }),
++      });
++
++      const data = await response.json();
++
++      if (!response.ok) {
++        toast.error(data.message ?? "App Builder failed");
++        return;
++      }
++
++      setPlan(data.plan);
++    } catch {
++      toast.error("App Builder failed");
++    } finally {
++      setIsGenerating(false);
++    }
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 p-4 md:p-8">
++      <StudioHeader
++        icon={<FolderCodeIcon className="size-4" />}
++        title="App Builder"
++      />
++
++      <div className="flex flex-col gap-4">
++        <Textarea
++          className="min-h-28 resize-none"
++          onChange={(e) => setPrompt(e.target.value)}
++          placeholder='Describe the app you want to scaffold, e.g. "a habit tracker with a streak counter"…'
++          value={prompt}
++        />
++
++        <Button
++          className="self-end"
++          disabled={isGenerating}
++          onClick={handleGenerate}
++        >
++          {isGenerating ? (
++            <Spinner className="size-4" />
++          ) : (
++            <SparklesIcon className="size-4" />
++          )}
++          Scaffold app
++        </Button>
++      </div>
++
++      {isGenerating && (
++        <div className="flex flex-1 items-center justify-center rounded-xl border border-border/50 bg-muted/30 p-4">
++          <div className="flex flex-col items-center gap-2 text-muted-foreground text-sm">
++            <Spinner className="size-5" />
++            Scaffolding your app…
++          </div>
++        </div>
++      )}
++
++      {!isGenerating && plan && (
++        <div className="flex flex-col gap-6">
++          <div className="flex flex-col gap-2">
++            <h2 className="font-semibold text-lg">{plan.appName}</h2>
++            <p className="text-muted-foreground text-sm">{plan.summary}</p>
++            <div className="flex flex-wrap gap-1.5">
++              {plan.stack.map((tech) => (
++                <Badge key={tech} variant="secondary">
++                  {tech}
++                </Badge>
++              ))}
++            </div>
++          </div>
++
++          <div className="flex flex-col gap-3">
++            {plan.files.map((file) => (
++              <CodeBlock
++                code={file.content}
++                key={file.path}
++                language={toShikiLanguage(file.language)}
++              >
++                <CodeBlockHeader>
++                  <span className="font-mono text-xs">{file.path}</span>
++                  <CodeBlockCopyButton />
++                </CodeBlockHeader>
++              </CodeBlock>
++            ))}
++          </div>
++
++          {plan.nextSteps.length > 0 && (
++            <div className="flex flex-col gap-2 rounded-xl border border-border/50 bg-muted/30 p-4">
++              <h3 className="font-medium text-sm">Next steps</h3>
++              <ol className="list-inside list-decimal space-y-1 text-muted-foreground text-sm">
++                {plan.nextSteps.map((step) => (
++                  <li key={step}>{step}</li>
++                ))}
++              </ol>
++            </div>
++          )}
++        </div>
++      )}
++
++      {!(isGenerating || plan) && (
++        <div className="flex flex-1 items-center justify-center rounded-xl border border-border/50 bg-muted/30 p-4 text-center text-muted-foreground text-sm">
++          Your scaffolded app will appear here
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/components/chat/studio/image-studio.tsx b/components/chat/studio/image-studio.tsx
+new file mode 100644
+index 0000000..da5eb71
+--- /dev/null
++++ b/components/chat/studio/image-studio.tsx
+@@ -0,0 +1,153 @@
++"use client";
++
++import { ImageIcon, SparklesIcon } from "lucide-react";
++import { useState } from "react";
++import { toast } from "sonner";
++import { Button } from "@/components/ui/button";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import { Spinner } from "@/components/ui/spinner";
++import { Textarea } from "@/components/ui/textarea";
++import { getStudioModelsByKind } from "@/lib/ai/models";
++import { StudioHeader } from "./studio-header";
++
++const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
++const models = getStudioModelsByKind("image");
++
++type GeneratedImage = {
++  imageBase64: string;
++  mediaType: string;
++  modelId: string;
++};
++
++export function ImageStudio() {
++  const [prompt, setPrompt] = useState("");
++  const [modelId, setModelId] = useState(models[0]?.id ?? "");
++  const [aspectRatio, setAspectRatio] =
++    useState<(typeof ASPECT_RATIOS)[number]>("1:1");
++  const [isGenerating, setIsGenerating] = useState(false);
++  const [result, setResult] = useState<GeneratedImage | null>(null);
++
++  const handleGenerate = async () => {
++    if (!prompt.trim()) {
++      toast.error("Write a prompt first");
++      return;
++    }
++
++    setIsGenerating(true);
++    setResult(null);
++
++    try {
++      const response = await fetch("/api/studio/image", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ prompt, modelId, aspectRatio }),
++      });
++
++      const data = await response.json();
++
++      if (!response.ok) {
++        toast.error(data.message ?? "Image generation failed");
++        return;
++      }
++
++      setResult(data);
++    } catch {
++      toast.error("Image generation failed");
++    } finally {
++      setIsGenerating(false);
++    }
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 p-4 md:p-8">
++      <StudioHeader
++        icon={<ImageIcon className="size-4" />}
++        title="Image Studio"
++      />
++
++      <div className="flex flex-col gap-4">
++        <Textarea
++          className="min-h-28 resize-none"
++          onChange={(e) => setPrompt(e.target.value)}
++          placeholder="Describe the image you want to generate…"
++          value={prompt}
++        />
++
++        <div className="flex flex-wrap items-center gap-3">
++          <Select onValueChange={setModelId} value={modelId}>
++            <SelectTrigger className="w-48">
++              <SelectValue placeholder="Model" />
++            </SelectTrigger>
++            <SelectContent>
++              {models.map((model) => (
++                <SelectItem key={model.id} value={model.id}>
++                  {model.name}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++
++          <Select
++            onValueChange={(v) =>
++              setAspectRatio(v as (typeof ASPECT_RATIOS)[number])
++            }
++            value={aspectRatio}
++          >
++            <SelectTrigger className="w-32">
++              <SelectValue placeholder="Aspect ratio" />
++            </SelectTrigger>
++            <SelectContent>
++              {ASPECT_RATIOS.map((ratio) => (
++                <SelectItem key={ratio} value={ratio}>
++                  {ratio}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++
++          <Button
++            className="ml-auto"
++            disabled={isGenerating}
++            onClick={handleGenerate}
++          >
++            {isGenerating ? (
++              <Spinner className="size-4" />
++            ) : (
++              <SparklesIcon className="size-4" />
++            )}
++            Generate
++          </Button>
++        </div>
++      </div>
++
++      <div className="flex flex-1 items-center justify-center rounded-xl border border-border/50 bg-muted/30 p-4">
++        {isGenerating && (
++          <div className="flex flex-col items-center gap-2 text-muted-foreground text-sm">
++            <Spinner className="size-5" />
++            Generating with {models.find((m) => m.id === modelId)?.name}…
++          </div>
++        )}
++
++        {!isGenerating && result && (
++          <img
++            alt={prompt}
++            className="max-h-[60vh] rounded-lg object-contain"
++            src={`data:${result.mediaType};base64,${result.imageBase64}`}
++          />
++        )}
++
++        {!(isGenerating || result) && (
++          <div className="text-center text-muted-foreground text-sm">
++            Your generated image will appear here
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/components/chat/studio/studio-header.tsx b/components/chat/studio/studio-header.tsx
+new file mode 100644
+index 0000000..90e29ec
+--- /dev/null
++++ b/components/chat/studio/studio-header.tsx
+@@ -0,0 +1,33 @@
++"use client";
++
++import { PanelLeftIcon } from "lucide-react";
++import type { ReactNode } from "react";
++import { Button } from "@/components/ui/button";
++import { useSidebar } from "@/components/ui/sidebar";
++
++export function StudioHeader({
++  title,
++  icon,
++}: {
++  title: string;
++  icon: ReactNode;
++}) {
++  const { toggleSidebar } = useSidebar();
++
++  return (
++    <header className="sticky top-0 z-10 flex h-14 items-center gap-2 border-border/50 border-b bg-sidebar px-3">
++      <Button
++        className="md:hidden"
++        onClick={toggleSidebar}
++        size="icon-sm"
++        variant="ghost"
++      >
++        <PanelLeftIcon className="size-4" />
++      </Button>
++      <div className="flex items-center gap-2 font-medium text-sm">
++        {icon}
++        {title}
++      </div>
++    </header>
++  );
++}
+diff --git a/components/chat/studio/video-studio.tsx b/components/chat/studio/video-studio.tsx
+new file mode 100644
+index 0000000..a2e3d66
+--- /dev/null
++++ b/components/chat/studio/video-studio.tsx
+@@ -0,0 +1,204 @@
++"use client";
++
++import { SparklesIcon, VideoIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
++import { useState } from "react";
++import { toast } from "sonner";
++import { Button } from "@/components/ui/button";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import { Spinner } from "@/components/ui/spinner";
++import { Textarea } from "@/components/ui/textarea";
++import { getStudioModelsByKind } from "@/lib/ai/models";
++import { StudioHeader } from "./studio-header";
++
++const ASPECT_RATIOS = ["16:9", "9:16", "1:1"] as const;
++const DURATIONS = [3, 5, 8] as const;
++const models = getStudioModelsByKind("image"); // Cosmos3 variants serve image + video
++
++type GeneratedVideo = {
++  videoBase64: string;
++  mediaType: string;
++  modelId: string;
++  withSound: boolean;
++};
++
++export function VideoStudio() {
++  const [prompt, setPrompt] = useState("");
++  const [modelId, setModelId] = useState(models[0]?.id ?? "");
++  const [aspectRatio, setAspectRatio] =
++    useState<(typeof ASPECT_RATIOS)[number]>("16:9");
++  const [durationSeconds, setDurationSeconds] =
++    useState<(typeof DURATIONS)[number]>(5);
++  const [withSound, setWithSound] = useState(false);
++  const [isGenerating, setIsGenerating] = useState(false);
++  const [result, setResult] = useState<GeneratedVideo | null>(null);
++
++  const handleGenerate = async () => {
++    if (!prompt.trim()) {
++      toast.error("Write a prompt first");
++      return;
++    }
++
++    setIsGenerating(true);
++    setResult(null);
++
++    try {
++      const response = await fetch("/api/studio/video", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          prompt,
++          modelId,
++          aspectRatio,
++          durationSeconds,
++          withSound,
++        }),
++      });
++
++      const data = await response.json();
++
++      if (!response.ok) {
++        toast.error(data.message ?? "Video generation failed");
++        return;
++      }
++
++      setResult(data);
++    } catch {
++      toast.error("Video generation failed");
++    } finally {
++      setIsGenerating(false);
++    }
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 p-4 md:p-8">
++      <StudioHeader
++        icon={<VideoIcon className="size-4" />}
++        title="Video Studio"
++      />
++
++      <div className="flex flex-col gap-4">
++        <Textarea
++          className="min-h-28 resize-none"
++          onChange={(e) => setPrompt(e.target.value)}
++          placeholder="Describe the video you want to generate — narrative paragraphs work best…"
++          value={prompt}
++        />
++
++        <div className="flex flex-wrap items-center gap-3">
++          <Select onValueChange={setModelId} value={modelId}>
++            <SelectTrigger className="w-48">
++              <SelectValue placeholder="Model" />
++            </SelectTrigger>
++            <SelectContent>
++              {models.map((model) => (
++                <SelectItem key={model.id} value={model.id}>
++                  {model.name}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++
++          <Select
++            onValueChange={(v) =>
++              setAspectRatio(v as (typeof ASPECT_RATIOS)[number])
++            }
++            value={aspectRatio}
++          >
++            <SelectTrigger className="w-28">
++              <SelectValue placeholder="Aspect ratio" />
++            </SelectTrigger>
++            <SelectContent>
++              {ASPECT_RATIOS.map((ratio) => (
++                <SelectItem key={ratio} value={ratio}>
++                  {ratio}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++
++          <Select
++            onValueChange={(v) =>
++              setDurationSeconds(Number(v) as (typeof DURATIONS)[number])
++            }
++            value={String(durationSeconds)}
++          >
++            <SelectTrigger className="w-28">
++              <SelectValue placeholder="Duration" />
++            </SelectTrigger>
++            <SelectContent>
++              {DURATIONS.map((d) => (
++                <SelectItem key={d} value={String(d)}>
++                  {d}s
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++
++          <Button
++            onClick={() => setWithSound((v) => !v)}
++            size="icon"
++            title={withSound ? "Sound on" : "Sound off"}
++            type="button"
++            variant={withSound ? "secondary" : "outline"}
++          >
++            {withSound ? (
++              <Volume2Icon className="size-4" />
++            ) : (
++              <VolumeXIcon className="size-4" />
++            )}
++          </Button>
++
++          <Button
++            className="ml-auto"
++            disabled={isGenerating}
++            onClick={handleGenerate}
++          >
++            {isGenerating ? (
++              <Spinner className="size-4" />
++            ) : (
++              <SparklesIcon className="size-4" />
++            )}
++            Generate
++          </Button>
++        </div>
++        <p className="text-muted-foreground text-xs">
++          Sound generates a soundtrack baked into the clip — Cosmos3 doesn't
++          do separate narration. For voiceover, use Voice Studio.
++        </p>
++      </div>
++
++      <div className="flex flex-1 items-center justify-center rounded-xl border border-border/50 bg-muted/30 p-4">
++        {isGenerating && (
++          <div className="flex flex-col items-center gap-2 text-muted-foreground text-sm">
++            <Spinner className="size-5" />
++            Generating with {models.find((m) => m.id === modelId)?.name}…
++            This can take a while.
++          </div>
++        )}
++
++        {!isGenerating && result && (
++          // biome-ignore lint/a11y/useMediaCaption: generated content has no caption track yet
++          <video
++            className="max-h-[60vh] rounded-lg"
++            controls
++            src={`data:${result.mediaType};base64,${result.videoBase64}`}
++          >
++            <track kind="captions" />
++          </video>
++        )}
++
++        {!(isGenerating || result) && (
++          <div className="text-center text-muted-foreground text-sm">
++            Your generated video will appear here
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/components/chat/studio/voice-studio.tsx b/components/chat/studio/voice-studio.tsx
+new file mode 100644
+index 0000000..392d4cd
+--- /dev/null
++++ b/components/chat/studio/voice-studio.tsx
+@@ -0,0 +1,164 @@
++"use client";
++
++import { MicIcon, SparklesIcon } from "lucide-react";
++import { useState } from "react";
++import { toast } from "sonner";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import { Spinner } from "@/components/ui/spinner";
++import { Textarea } from "@/components/ui/textarea";
++import { StudioHeader } from "./studio-header";
++
++const VOICES = [
++  "Vivian",
++  "Serena",
++  "Uncle_Fu",
++  "Dylan",
++  "Eric",
++  "Ryan",
++  "Aiden",
++  "Ono_Anna",
++  "Sohee",
++] as const;
++
++type GeneratedSpeech = {
++  audioBase64: string;
++  mediaType: string;
++  voice: string;
++};
++
++export function VoiceStudio() {
++  const [text, setText] = useState("");
++  const [voice, setVoice] = useState<(typeof VOICES)[number]>("Vivian");
++  const [instructions, setInstructions] = useState("");
++  const [isGenerating, setIsGenerating] = useState(false);
++  const [result, setResult] = useState<GeneratedSpeech | null>(null);
++
++  const handleGenerate = async () => {
++    if (!text.trim()) {
++      toast.error("Write some text first");
++      return;
++    }
++
++    setIsGenerating(true);
++    setResult(null);
++
++    try {
++      const response = await fetch("/api/studio/voice", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          text,
++          voice,
++          instructions: instructions.trim() || undefined,
++        }),
++      });
++
++      const data = await response.json();
++
++      if (!response.ok) {
++        toast.error(data.message ?? "Speech generation failed");
++        return;
++      }
++
++      if (data.unexpectedJson) {
++        toast.error(data.note ?? "Unexpected response from the provider");
++        return;
++      }
++
++      setResult(data);
++    } catch {
++      toast.error("Speech generation failed");
++    } finally {
++      setIsGenerating(false);
++    }
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 p-4 md:p-8">
++      <StudioHeader icon={<MicIcon className="size-4" />} title="Voice Studio" />
++
++      <div className="flex flex-col gap-4">
++        <Textarea
++          className="min-h-28 resize-none"
++          maxLength={4000}
++          onChange={(e) => setText(e.target.value)}
++          placeholder="Type the text you want narrated…"
++          value={text}
++        />
++
++        <Input
++          onChange={(e) => setInstructions(e.target.value)}
++          placeholder='Optional: speaking style, e.g. "speak slowly and calmly"'
++          value={instructions}
++        />
++
++        <div className="flex flex-wrap items-center gap-3">
++          <Select
++            onValueChange={(v) => setVoice(v as (typeof VOICES)[number])}
++            value={voice}
++          >
++            <SelectTrigger className="w-44">
++              <SelectValue placeholder="Voice" />
++            </SelectTrigger>
++            <SelectContent>
++              {VOICES.map((v) => (
++                <SelectItem key={v} value={v}>
++                  {v.replace("_", " ")}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++
++          <Button
++            className="ml-auto"
++            disabled={isGenerating}
++            onClick={handleGenerate}
++          >
++            {isGenerating ? (
++              <Spinner className="size-4" />
++            ) : (
++              <SparklesIcon className="size-4" />
++            )}
++            Generate
++          </Button>
++        </div>
++        <p className="text-muted-foreground text-xs">
++          Powered by Qwen3-TTS on DeepInfra — not Cosmos3, which doesn't have
++          a standalone narration mode.
++        </p>
++      </div>
++
++      <div className="flex flex-1 items-center justify-center rounded-xl border border-border/50 bg-muted/30 p-4">
++        {isGenerating && (
++          <div className="flex flex-col items-center gap-2 text-muted-foreground text-sm">
++            <Spinner className="size-5" />
++            Generating with {voice}…
++          </div>
++        )}
++
++        {!isGenerating && result && (
++          // biome-ignore lint/a11y/useMediaCaption: generated narration has no separate transcript track
++          <audio
++            className="w-full"
++            controls
++            src={`data:${result.mediaType};base64,${result.audioBase64}`}
++          />
++        )}
++
++        {!(isGenerating || result) && (
++          <div className="text-center text-muted-foreground text-sm">
++            Your generated audio will appear here
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/lib/ai/models.ts b/lib/ai/models.ts
+index eac9514..26ea453 100644
+--- a/lib/ai/models.ts
++++ b/lib/ai/models.ts
+@@ -165,3 +165,62 @@ export const modelsByProvider = chatModels.reduce(
+   },
+   {} as Record<string, ChatModel[]>
+ );
++
++export type StudioModelKind = "image" | "video" | "voice";
++
++export type StudioModel = {
++  id: string;
++  name: string;
++  provider: string;
++  description: string;
++  kind: StudioModelKind;
++  gatewayOrder: string[];
++};
++
++export const studioModels: StudioModel[] = [
++  {
++    id: "nvidia/cosmos3-nano",
++    name: "Cosmos 3 Nano",
++    provider: "nvidia",
++    description: "Fast omnimodal generation — image, video, and audio",
++    kind: "image",
++    gatewayOrder: ["deepinfra"],
++  },
++  {
++    id: "nvidia/cosmos3-super",
++    name: "Cosmos 3 Super",
++    provider: "nvidia",
++    description: "High-fidelity omnimodal generation — image, video, and audio",
++    kind: "image",
++    gatewayOrder: ["deepinfra"],
++  },
++];
++
++export const studioChatModels: ChatModel[] = [
++  {
++    id: "google/gemma-4-26b-a4b-it",
++    name: "Gemma 4 26B-A4B",
++    provider: "google",
++    description: "Multimodal MoE chat model (26B total, 4B active)",
++    gatewayOrder: ["deepinfra"],
++  },
++  {
++    id: "google/gemma-4-31b-it",
++    name: "Gemma 4 31B",
++    provider: "google",
++    description: "Multimodal chat model for the App Builder assistant",
++    gatewayOrder: ["deepinfra"],
++  },
++];
++
++export function getStudioModelsByKind(kind: StudioModelKind): StudioModel[] {
++  return studioModels.filter((m) => m.kind === kind);
++}
++
++export const allowedStudioModelIds = new Set(
++  studioModels.map((m) => m.id)
++);
++
++export const allowedStudioChatModelIds = new Set(
++  studioChatModels.map((m) => m.id)
++);
+diff --git a/lib/errors.ts b/lib/errors.ts
+index 68f569b..90443f6 100644
+--- a/lib/errors.ts
++++ b/lib/errors.ts
+@@ -16,7 +16,8 @@ export type Surface =
+   | "vote"
+   | "document"
+   | "suggestions"
+-  | "activate_gateway";
++  | "activate_gateway"
++  | "studio";
+ 
+ export type ErrorCode = `${ErrorType}:${Surface}`;
+ 
+@@ -33,6 +34,7 @@ export const visibilityBySurface: Record<Surface, ErrorVisibility> = {
+   document: "response",
+   suggestions: "response",
+   activate_gateway: "response",
++  studio: "response",
+ };
+ 
+ export class ChatbotError extends Error {
+@@ -112,6 +114,13 @@ export function getMessageByErrorCode(errorCode: ErrorCode): string {
+     case "bad_request:document":
+       return "The request to create or update the document was invalid. Please check your input and try again.";
+ 
++    case "unauthorized:studio":
++      return "You need to sign in to use the studio tools.";
++    case "bad_request:studio":
++      return "The request couldn't be processed. Please check your input and try again.";
++    case "rate_limit:studio":
++      return "You've reached the generation limit. Come back in 1 hour to continue.";
++
+     default:
+       return "Something went wrong. Please try again later.";
+   }

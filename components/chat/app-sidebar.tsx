@@ -1,13 +1,17 @@
 "use client";
 
 import {
+  FolderCodeIcon,
+  ImageIcon,
   MessageSquareIcon,
+  MicIcon,
   PanelLeftIcon,
   PenSquareIcon,
   TrashIcon,
+  VideoIcon,
 } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import type { User } from "next-auth";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -46,6 +50,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 
 export function AppSidebar({ user }: { user: User | undefined }) {
   const router = useRouter();
+  const pathname = usePathname();
   const { setOpenMobile, toggleSidebar } = useSidebar();
   const { mutate } = useSWRConfig();
   const [showDeleteAllDialog, setShowDeleteAllDialog] = useState(false);
@@ -129,6 +134,35 @@ export function AppSidebar({ user }: { user: User | undefined }) {
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 )}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+          <SidebarGroup className="pt-0">
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {[
+                  { href: "/image", label: "Image Studio", icon: ImageIcon },
+                  { href: "/video", label: "Video Studio", icon: VideoIcon },
+                  { href: "/voice", label: "Voice Studio", icon: MicIcon },
+                  {
+                    href: "/app-builder",
+                    label: "App Builder",
+                    icon: FolderCodeIcon,
+                  },
+                ].map(({ href, label, icon: Icon }) => (
+                  <SidebarMenuItem key={href}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={pathname === href}
+                      tooltip={label}
+                    >
+                      <Link href={href} onClick={() => setOpenMobile(false)}>
+                        <Icon className="size-4" />
+                        <span>{label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>

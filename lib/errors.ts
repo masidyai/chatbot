@@ -16,7 +16,8 @@ export type Surface =
   | "vote"
   | "document"
   | "suggestions"
-  | "activate_gateway";
+  | "activate_gateway"
+  | "studio";
 
 export type ErrorCode = `${ErrorType}:${Surface}`;
 
@@ -33,6 +34,7 @@ export const visibilityBySurface: Record<Surface, ErrorVisibility> = {
   document: "response",
   suggestions: "response",
   activate_gateway: "response",
+  studio: "response",
 };
 
 export class ChatbotError extends Error {
@@ -111,6 +113,13 @@ export function getMessageByErrorCode(errorCode: ErrorCode): string {
       return "You need to sign in to view this document. Please sign in and try again.";
     case "bad_request:document":
       return "The request to create or update the document was invalid. Please check your input and try again.";
+
+    case "unauthorized:studio":
+      return "You need to sign in to use the studio tools.";
+    case "bad_request:studio":
+      return "The request couldn't be processed. Please check your input and try again.";
+    case "rate_limit:studio":
+      return "You've reached the generation limit. Come back in 1 hour to continue.";
 
     default:
       return "Something went wrong. Please try again later.";
